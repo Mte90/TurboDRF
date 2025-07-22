@@ -8,6 +8,10 @@ from rest_framework.response import Response
 from .permissions import DefaultDjangoPermission, TurboDRFPermission
 from .serializers import TurboDRFSerializer
 
+from allauth.headless.contrib.rest_framework.authentication import (
+    XSessionTokenAuthentication,
+)
+from rest_framework import permissions
 
 class TurboDRFPagination(PageNumberPagination):
     """
@@ -133,6 +137,12 @@ class TurboDRFViewSet(viewsets.ModelViewSet):
         if not getattr(settings, "TURBODRF_DISABLE_PERMISSIONS", False)
         else []
     )
+    
+    if getattr(settings, "TURBODRF_ENABLE_ALLAUTH", False) and config.get('auth', False):
+        self.permission_classes = [permissions.IsAuthenticated]
+        self.authentication_classes = [
+            XSessionTokenAuthentication,
+        ]
     pagination_class = TurboDRFPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
 
