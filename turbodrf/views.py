@@ -216,7 +216,7 @@ class TurboDRFViewSet(viewsets.ModelViewSet):
             fields_to_use if isinstance(fields_to_use, list) else fields_to_use
         )
 
-        if self.action not in ["list", "detail"]:
+        if self.action not in ["list", "detail", "retrieve"]:
             fields_to_use = "__all__"
 
         # Process fields to separate simple and nested fields
