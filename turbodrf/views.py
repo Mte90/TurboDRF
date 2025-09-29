@@ -194,7 +194,6 @@ class TurboDRFViewSet(viewsets.ModelViewSet):
 
         if self.action not in ["list", "detail", "retrieve"]:
             fields_to_use = "__all__"
-            
         # Store original fields before processing
         original_fields = (
             fields_to_use if isinstance(fields_to_use, list) else fields_to_use
