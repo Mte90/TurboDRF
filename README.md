@@ -651,6 +651,15 @@ class BookViewSet(TurboDRFViewSet):
     pagination_class = CustomPagination
 ```
 
+### 🔍 Ignore fields for Django-filter
+
+If your project uses custom or third-party model fields that django-filter does not support, django-filter can fail when building filtersets.  
+To avoid this, TurboDRF provides the `TURBODRF_IGNORE_FIELD_TYPE` setting so you can list field types to ignore.
+
+```
+TURBODRF_IGNORE_FIELD_TYPE = ["VersatileImageField"] # https://github.com/respondcreate/django-versatileimagefield
+```
+
 ### 📝 Custom Metadata
 
 Customize OPTIONS responses:
