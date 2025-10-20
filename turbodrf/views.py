@@ -1,5 +1,7 @@
 from django.conf import settings
 from django_filters.rest_framework import DjangoFilterBackend
+from django.db.models import Count, Q
+from django.http import QueryDict
 from rest_framework import status, viewsets
 from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.pagination import PageNumberPagination
@@ -336,6 +338,199 @@ class TurboDRFViewSet(viewsets.ModelViewSet):
 
         if select_related_fields:
             queryset = queryset.select_related(*select_related_fields)
+
+        request = getattr(self, "request", None)
+
+        # Identify M2M candidate keys (those that reference a M2M field)
+        m2m_candidate_keys = []
+        if request is not None:
+            raw_keys = list(request.query_params.keys())
+            if hasattr(request, "data") and isinstance(request.data, dict):
+                raw_keys += [k for k in request.data.keys() if k not in raw_keys]
+
+            for raw_key in raw_keys:
+                key = raw_key[:-2] if raw_key.endswith("[]") else raw_key
+                parts = key.split("__")
+                if len(parts) < 2:
+                    continue
+                rel_field_name = parts[0]
+                try:
+                    f = self.model._meta.get_field(rel_field_name)
+                except Exception:
+                    continue
+                if getattr(f, "many_to_many", False):
+                    m2m_candidate_keys.append(key)
+
+            # Call DjangoFilterBackend with merged GET (query_params + request.data),
+            # but with M2M keys removed so comma-separated values are split and not
+            # interpreted as a single literal by django-filter.
+            if m2m_candidate_keys:
+                original_get = None
+                try:
+                    # build merged_get from query_params and request.data
+                    merged_get = QueryDict(mutable=True)
+
+                    # start from request.query_params
+                    for k in request.query_params:
+                        # skip M2M candidate keys (both forms)
+                        base_k = k[:-2] if k.endswith("[]") else k
+                        if base_k in m2m_candidate_keys:
+                            continue
+                        values = request.query_params.getlist(k)
+                        merged_get.setlist(k, values)
+
+                    # merge request.data (POST body) for non-M2M keys
+                    if hasattr(request, "data") and isinstance(request.data, dict):
+                        for k, dv in request.data.items():
+                            base_k = k[:-2] if k.endswith("[]") else k
+                            if base_k in m2m_candidate_keys:
+                                continue
+                            # normalize dv into list of strings
+                            if isinstance(dv, list):
+                                vals = [str(x) for x in dv]
+                            elif isinstance(dv, str) and "," in dv:
+                                vals = [s.strip() for s in dv.split(",") if s.strip()]
+                            elif dv is None:
+                                vals = []
+                            else:
+                                vals = [str(dv)]
+                            # merge values, preserving existing ones and avoiding duplicates
+                            existing = merged_get.getlist(k)
+                            for v in vals:
+                                if v not in existing:
+                                    existing.append(v)
+                            merged_get.setlist(k, existing)
+
+                    # Replace request._request.GET temporarily (if available)
+                    if hasattr(request, "_request") and hasattr(request._request, "GET"):
+                        original_get = request._request.GET
+                        request._request.GET = merged_get
+
+                    # Apply django-filter (non-M2M filters applied)
+                    queryset = DjangoFilterBackend().filter_queryset(request, queryset, self)
+                finally:
+                    if original_get is not None and hasattr(request, "_request"):
+                        request._request.GET = original_get
+
+                # Prevent DRF from applying DjangoFilterBackend again later
+                self.filter_backends = [fb for fb in self.filter_backends if fb is not DjangoFilterBackend]
+            else:
+                # No M2M special handling needed — let DjangoFilterBackend run normally
+                queryset = DjangoFilterBackend().filter_queryset(request, queryset, self)
+                # and leave filter_backends as is
+
+            # Parse M2M filters (support query params and request.data)
+            m2m_filters = []
+            seen_keys = []
+
+            query_keys = list(request.query_params.keys())
+            data_keys = list(request.data.keys()) if hasattr(request, "data") and isinstance(request.data, dict) else []
+
+            for key in query_keys + [k for k in data_keys if k not in query_keys]:
+                if key in seen_keys:
+                    continue
+                seen_keys.append(key)
+
+                # Normalize and collect values from query params
+                if key.endswith("[]"):
+                    key_name = key[:-2]
+                    values = request.query_params.getlist(key)
+                else:
+                    key_name = key
+                    values = request.query_params.getlist(key) or []
+                    if not values:
+                        qv = request.query_params.get(key)
+                        if qv:
+                            if isinstance(qv, str) and "," in qv:
+                                values = [s.strip() for s in qv.split(",") if s.strip()]
+                            else:
+                                values = [qv]
+
+                # Also collect from request.data (POST support)
+                if key_name in request.data:
+                    dv = request.data.get(key_name)
+                    if isinstance(dv, list):
+                        values_from_data = [str(x) for x in dv]
+                    elif isinstance(dv, str) and "," in dv:
+                        values_from_data = [s.strip() for s in dv.split(",") if s.strip()]
+                    elif dv is None:
+                        values_from_data = []
+                    else:
+                        values_from_data = [str(dv)]
+                    for v in values_from_data:
+                        if v not in values:
+                            values.append(v)
+
+                if not values:
+                    continue
+
+                # Expand comma-containing entries and deduplicate
+                expanded = []
+                for v in values:
+                    if isinstance(v, str) and "," in v:
+                        expanded.extend([s.strip() for s in v.split(",") if s.strip()])
+                    else:
+                        expanded.append(v)
+                deduped = []
+                seen = set()
+                for v in expanded:
+                    if v not in seen:
+                        seen.add(v)
+                        deduped.append(v)
+                values = deduped
+
+                if not values:
+                    continue
+
+                parts = key_name.split("__")
+                if len(parts) < 2:
+                    continue
+
+                rel_field_name = parts[0]
+                lookup_rest = "__".join(parts[1:])
+
+                try:
+                    rel_field = self.model._meta.get_field(rel_field_name)
+                except Exception:
+                    continue
+
+                if getattr(rel_field, "many_to_many", False):
+                    cleaned = [v.strip().strip('"') for v in values if v and str(v).strip()]
+                    if not cleaned:
+                        continue
+
+                    # read condition param: <key>_cond or <key>_cond[]
+                    cond_param_keys = [f"{key_name}_cond", f"{key_name}_cond[]"]
+                    cond_value = None
+                    for ck in cond_param_keys:
+                        if ck in request.query_params:
+                            cond_value = request.query_params.get(ck)
+                            break
+                        if ck in request.data:
+                            cond_value = request.data.get(ck)
+                            break
+                    cond = (str(cond_value).strip().upper() if cond_value is not None else None)
+                    if cond not in ("AND", "OR"):
+                        cond = "OR" if len(cleaned) > 1 else "OR"
+
+                    m2m_filters.append((rel_field_name, lookup_rest, cleaned, cond))
+
+            # Apply M2M filters
+            if m2m_filters:
+                for idx, (rel_field_name, lookup_rest, values, cond) in enumerate(m2m_filters):
+                    if cond == "AND":
+                        ann_name = f"_turbodrf_m2m_matched_{idx}"
+                        q_lookup = {f"{rel_field_name}__{lookup_rest}__in": values}
+                        queryset = queryset.annotate(
+                            **{
+                                ann_name: Count(
+                                    rel_field_name, filter=Q(**q_lookup), distinct=True
+                                )
+                            }
+                        ).filter(**{ann_name: len(values)})
+                    else:  # OR
+                        q_lookup = {f"{rel_field_name}__{lookup_rest}__in": values}
+                        queryset = queryset.filter(**q_lookup).distinct()
 
         return queryset
 
