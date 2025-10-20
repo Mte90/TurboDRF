@@ -152,10 +152,6 @@ class TurboDRFViewSet(viewsets.ModelViewSet):
         super().initial(request, *args, **kwargs)
 
         config = getattr(self.model, "turbodrf", lambda: {})()
-
-        if getattr(settings, "TURBODRF_ENABLE_ALLAUTH", False) and config.get("auth", False):
-            self.authentication_classes = [XSessionTokenAuthentication]
-            self.permission_classes = [permissions.IsAuthenticated]
             
     def get_serializer_class(self):
         """
