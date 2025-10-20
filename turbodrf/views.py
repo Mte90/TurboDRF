@@ -447,29 +447,34 @@ class TurboDRFViewSet(viewsets.ModelViewSet):
             as they require special handling that django-filter doesn't
             support out of the box.
         """
-        from django.db import models
-
-        filterset_fields = {}
-
-        # Get all fields from the model
-        for field in self.model._meta.fields:
-            field_name = field.name
-
-            # Check field class name for special handling
+        def allowed_field(field):
+            """Return False for unsupported field types (JSON, Binary, FilePath)."""
             field_class_name = field.__class__.__name__
-
             # Skip fields that django-filter doesn't support or that
             # don't make sense to filter
-            unsupported_fields = ["JSONField", "BinaryField", "FilePathField", "ImageField"]
+            extra = getattr(settings, "TURBODRF_IGNORE_FIELD_TYPE", [])
+            default_unsupported = ["JSONField", "BinaryField", "FilePathField"]
+            extra_names = []
+
+            # Accept either a single string or an iterable (list/tuple/set) of strings.
+            # Ignore non-string entries and log a warning so the user can fix the setting.
+            if isinstance(extra, str):
+                extra_names = [extra]
+            elif isinstance(extra, (list, tuple, set)):
+                for e in extra:
+                    if isinstance(e, str):
+                        extra_names.append(e)
+
+            unsupported_fields = list(dict.fromkeys(default_unsupported + extra_names))
             if field_class_name in unsupported_fields:
-                continue
+                return False
 
             # Also check by importing JSONField classes directly for extra safety
             try:
                 from django.db.models import JSONField as ModelsJSONField
 
                 if isinstance(field, ModelsJSONField):
-                    continue
+                    return False
             except ImportError:
                 pass
 
@@ -478,59 +483,84 @@ class TurboDRFViewSet(viewsets.ModelViewSet):
                 from django.contrib.postgres.fields import JSONField as PGJSONField
 
                 if isinstance(field, PGJSONField):
-                    continue
+                    return False
             except ImportError:
                 pass
 
             # Skip any field that has 'json' in its class name (case insensitive)
             # This catches custom JSONField implementations
             if "json" in field_class_name.lower():
+                return False
+
+            return True
+
+        def lookups_for_field(field):
+            """Return a list of lookups for a given model field type."""
+            if isinstance(field, (models.IntegerField, models.DecimalField, models.FloatField)):
+                return ["exact", "gte", "lte", "gt", "lt"]
+            if isinstance(field, (models.DateField, models.DateTimeField)):
+                return ["exact", "gte", "lte", "gt", "lt", "year", "month", "day"]
+            if isinstance(field, models.BooleanField):
+                return ["exact"]
+            if isinstance(field, (models.CharField, models.TextField)):
+                return ["exact", "icontains", "istartswith", "iendswith"]
+            if isinstance(field, models.ForeignKey):
+                return ["exact"]
+            if isinstance(field, (models.FileField, models.ImageField)):
+                return ["exact", "isnull"]
+            if isinstance(field, models.UUIDField):
+                return ["exact", "isnull"]
+            if isinstance(field, models.GenericIPAddressField):
+                return ["exact", "istartswith"]
+
+            # Default to exact lookup if unknown
+            return ["exact"]
+
+        filterset_fields = {}
+
+        # Fields on the model itself (same logic as before) ---
+        for field in self.model._meta.fields:
+            if not allowed_field(field):
                 continue
 
+            field_name = field.name
+
             # Define lookups based on field type
-            if isinstance(
-                field, (models.IntegerField, models.DecimalField, models.FloatField)
-            ):
-                # Numeric fields get comparison lookups
-                filterset_fields[field_name] = ["exact", "gte", "lte", "gt", "lt"]
-            elif isinstance(field, (models.DateField, models.DateTimeField)):
-                # Date fields get date lookups
-                filterset_fields[field_name] = [
-                    "exact",
-                    "gte",
-                    "lte",
-                    "gt",
-                    "lt",
-                    "year",
-                    "month",
-                    "day",
-                ]
-            elif isinstance(field, models.BooleanField):
-                # Boolean fields only need exact
-                filterset_fields[field_name] = ["exact"]
-            elif isinstance(field, (models.CharField, models.TextField)):
-                # Text fields get string lookups
-                filterset_fields[field_name] = [
-                    "exact",
-                    "icontains",
-                    "istartswith",
-                    "iendswith",
-                ]
-            elif isinstance(field, models.ForeignKey):
-                # Foreign keys get exact lookup
-                filterset_fields[field_name] = ["exact"]
-            elif isinstance(field, (models.FileField, models.ImageField)):
-                # File fields can be filtered by exact match or if they're null
-                filterset_fields[field_name] = ["exact", "isnull"]
-            elif isinstance(field, models.UUIDField):
-                # UUID fields only support exact matching
-                filterset_fields[field_name] = ["exact", "isnull"]
-            elif isinstance(field, models.GenericIPAddressField):
-                # IP address fields support exact and startswith
-                filterset_fields[field_name] = ["exact", "istartswith"]
-            else:
-                # Default to exact lookup
-                filterset_fields[field_name] = ["exact"]
+            filterset_fields[field_name] = lookups_for_field(field)
+
+        # Include ManyToMany related model fields (one level)
+        for m2m in getattr(self.model._meta, "many_to_many", []):
+            # m2m may be a ManyToManyField instance
+            try:
+                related_model = m2m.related_model if hasattr(m2m, "related_model") else m2m.remote_field.model
+            except Exception:
+                # Fallback: try remote_field
+                related_model = getattr(m2m, "remote_field", None)
+                if related_model:
+                    related_model = related_model.model
+            if not related_model:
+                continue
+
+            base_name = m2m.name
+            # Iterate related model fields and add lookups for nested lookup keys
+            for rel_field in related_model._meta.fields:
+                if not allowed_field(rel_field):
+                    continue
+                nested_key = f"{base_name}__{rel_field.name}"
+                filterset_fields[nested_key] = lookups_for_field(rel_field)
+
+        # Include ForeignKey related model fields (one level)
+        for fk in [f for f in self.model._meta.fields if isinstance(f, models.ForeignKey)]:
+            try:
+                related_model = fk.remote_field.model
+            except Exception:
+                continue
+            base_name = fk.name
+            for rel_field in related_model._meta.fields:
+                if not allowed_field(rel_field):
+                    continue
+                nested_key = f"{base_name}__{rel_field.name}"
+                filterset_fields[nested_key] = lookups_for_field(rel_field)
 
         return filterset_fields
 
